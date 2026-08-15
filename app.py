@@ -48,7 +48,24 @@ def to_excel_bytes(sheets: dict):
     return output.getvalue()
 
 
+def combine_cols(row, cols):
+    """Multiple columns ko ek text me jod deta hai (matching ke liye)."""
+    parts = [str(row[c]) for c in cols if c in row and pd.notna(row[c]) and str(row[c]).strip()]
+    return " ".join(parts)
+
+
+def first_nonempty(row, cols):
+    """Diye gaye columns me se pehli non-empty value laata hai (packshot ke liye)."""
+    for c in cols:
+        if c in row and pd.notna(row[c]) and str(row[c]).strip():
+            return row[c]
+    return ""
+
+
 EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+IMG_PATTERN = re.compile(r"image|packshot|pack ?shot|photo|img|picture", re.I)
+GROUP_PATTERN = re.compile(r"group|sku name|class|item name", re.I)
+CLASS_PATTERN = re.compile(r"class|sku|item", re.I)
 
 # =====================================================================
 # Sidebar navigation
@@ -56,7 +73,10 @@ EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 
 st.sidebar.title("📊 GridSync")
 st.sidebar.caption("Data daaliye, baaki khud ho jaayega")
-tool = st.sidebar.radio("Tool choose karein", ["Merge & Format", "Compare Files", "SKU Match"])
+tool = st.sidebar.radio(
+    "Tool choose karein",
+    ["Merge & Format", "Compare Files", "System SKU Catalog", "SKU Match"],
+)
 
 # =====================================================================
 # TOOL 1: Merge & Format
@@ -215,94 +235,183 @@ elif tool == "Compare Files":
         )
 
 # =====================================================================
-# TOOL 3: SKU Match
+# TOOL 3: System SKU Catalog  (NEW)
+# =====================================================================
+
+elif tool == "System SKU Catalog":
+    st.header("System SKU Catalog")
+    st.caption(
+        "Hamare system ki SKU/Group/Class sheet ek baar yahan upload karein — "
+        "iska data 'SKU Match' tab me automatically reuse hoga, dobara upload nahi karna padega."
+    )
+
+    catalog_file = st.file_uploader(
+        "System ki sheet upload karein (jaise: category, group_name, class_name, image link)",
+        type=["xlsx", "xls", "csv"],
+        key="catalog_file",
+    )
+    if catalog_file is not None:
+        st.session_state.system_df = read_uploaded_file(catalog_file)
+        st.session_state.system_file_name = catalog_file.name
+
+    if "system_df" in st.session_state:
+        df_catalog = st.session_state.system_df
+        cols = list(df_catalog.columns)
+
+        st.subheader("Columns select karein")
+        st.caption("Zaroorat ho to ek se zyada column bhi select kar sakte hain — dropdown me sirf click karke aur options jod dein.")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            group_default = [c for c in cols if GROUP_PATTERN.search(c)][:1]
+            system_group_cols = st.multiselect("Group column(s)", cols, default=group_default, key="sys_group_cols")
+        with c2:
+            class_default = [c for c in cols if CLASS_PATTERN.search(c) and c not in system_group_cols][:1]
+            system_class_cols = st.multiselect("Class / SKU column(s)", cols, default=class_default, key="sys_class_cols")
+        with c3:
+            pack_default = [c for c in cols if IMG_PATTERN.search(c)]
+            system_pack_cols = st.multiselect("Packshot column(s)", cols, default=pack_default, key="sys_pack_cols")
+
+        search = st.text_input("🔍 Search (naam se dhoondhein)")
+        view_df = df_catalog.copy()
+        if search:
+            mask = view_df.apply(lambda r: search.lower() in " ".join(str(v) for v in r.values).lower(), axis=1)
+            view_df = view_df[mask]
+
+        display_df = view_df.copy()
+        column_config = {}
+        if system_pack_cols:
+            display_df["Packshot"] = view_df.apply(lambda r: first_nonempty(r, system_pack_cols), axis=1)
+            column_config["Packshot"] = st.column_config.ImageColumn("Packshot", width="small")
+
+        st.dataframe(display_df, use_container_width=True, hide_index=True, column_config=column_config)
+        st.caption(f"Total {len(df_catalog)} entries system me hain — {len(view_df)} dikh rahi hain.")
+        st.info(
+            "Note: Image sirf tab dikhegi jab packshot column me ek link (http se shuru hone wala URL) ho. "
+            "Agar file me image seedhi cell ke andar chipki hui hai (embedded picture), wo text ke roop me nahi padhi ja sakti — "
+            "us case me packshot column me image ka link/URL rakhna behtar rahega."
+        )
+    else:
+        st.info("Upar se apni system sheet upload karke shuru karein.")
+
+# =====================================================================
+# TOOL 4: SKU Match  (multi-select group/class/packshot + image preview)
 # =====================================================================
 
 else:
     st.header("SKU Match")
-    st.caption("Client SKU ko aapke system ke SKU se match karein — naam alag hote hue bhi.")
+    st.caption("Client SKU ko aapke system ke SKU se match karein — naam alag hote hue bhi, packshot ke saath.")
 
-    c1, c2 = st.columns(2)
-    df_client = df_internal = None
-    client_sku_col = client_pack_col = internal_sku_col = None
+    if "system_df" not in st.session_state:
+        st.warning("Pehle **'System SKU Catalog'** tab me apni system sheet upload kar lein, phir yahan match karein.")
+    else:
+        df_internal = st.session_state.system_df
+        internal_group_cols = st.session_state.get("sys_group_cols", [])
+        internal_class_cols = st.session_state.get("sys_class_cols", [])
+        internal_pack_cols = st.session_state.get("sys_pack_cols", [])
+        internal_key_cols = internal_group_cols + internal_class_cols
 
-    with c1:
-        client_file = st.file_uploader("Client ki SKU file", type=["xlsx", "xls", "csv"], key="client_file")
-        if client_file:
-            df_client = read_uploaded_file(client_file)
-            guess_sku = next((c for c in df_client.columns if re.search(r"sku|code|item", c, re.I)), df_client.columns[0])
-            guess_pack = next((c for c in df_client.columns if re.search(r"pack ?shot|image|img|photo", c, re.I)), None)
-            client_sku_col = st.selectbox(
-                "SKU column", df_client.columns, index=list(df_client.columns).index(guess_sku), key="client_sku_col"
-            )
-            pack_options = ["— nahi hai —"] + list(df_client.columns)
-            default_pack_idx = pack_options.index(guess_pack) if guess_pack else 0
-            pack_choice = st.selectbox("Packshot column", pack_options, index=default_pack_idx, key="client_pack_col")
-            client_pack_col = None if pack_choice == "— nahi hai —" else pack_choice
-
-    with c2:
-        internal_file = st.file_uploader("Hamare system ki SKU file", type=["xlsx", "xls", "csv"], key="internal_file")
-        if internal_file:
-            df_internal = read_uploaded_file(internal_file)
-            guess_sku2 = next((c for c in df_internal.columns if re.search(r"sku|code|item", c, re.I)), df_internal.columns[0])
-            internal_sku_col = st.selectbox(
-                "SKU column", df_internal.columns, index=list(df_internal.columns).index(guess_sku2), key="internal_sku_col"
-            )
-
-    threshold = st.slider("Fuzzy match sensitivity", 50, 95, 75, step=5, format="%d%%") / 100.0
-
-    if st.button("🔎 Match karein", type="primary", disabled=not (client_file and internal_file)):
-        exact_map = {normalize(v): idx for idx, v in df_internal[internal_sku_col].items()}
-        results = []
-        for _, row in df_client.iterrows():
-            client_val = row[client_sku_col]
-            norm = normalize(client_val)
-            match_type, matched_val, confidence = "Unmatched", "", 0.0
-
-            if norm in exact_map:
-                matched_val = df_internal.loc[exact_map[norm], internal_sku_col]
-                match_type, confidence = "Exact", 1.0
-            else:
-                best_score, best_val = 0.0, None
-                for _, irow in df_internal.iterrows():
-                    sc = similarity(client_val, irow[internal_sku_col])
-                    if sc > best_score:
-                        best_score, best_val = sc, irow[internal_sku_col]
-                if best_val is not None and best_score >= threshold:
-                    matched_val, match_type, confidence = best_val, "Fuzzy", best_score
-
-            rec = {
-                "Client SKU": client_val,
-                "Matched SKU (Hamara System)": matched_val,
-                "Match Type": match_type,
-                "Confidence %": round(confidence * 100),
-            }
-            if client_pack_col:
-                rec["Packshot"] = row[client_pack_col]
-            results.append(rec)
-
-        st.session_state.match_results = pd.DataFrame(results)
-
-    if "match_results" in st.session_state:
-        results_df = st.session_state.match_results
-        counts = results_df["Match Type"].value_counts().to_dict()
-        m1, m2, m3 = st.columns(3)
-        m1.metric("✔ Exact", counts.get("Exact", 0))
-        m2.metric("⚠ Fuzzy", counts.get("Fuzzy", 0))
-        m3.metric("✕ Unmatched", counts.get("Unmatched", 0))
-
-        view = st.radio("View", ["Sabhi", "Fuzzy", "Unmatched"], horizontal=True)
-        if view == "Fuzzy":
-            show_df = results_df[results_df["Match Type"] == "Fuzzy"]
-        elif view == "Unmatched":
-            show_df = results_df[results_df["Match Type"] == "Unmatched"]
-        else:
-            show_df = results_df
-        st.dataframe(show_df, use_container_width=True)
-
-        st.download_button(
-            "⬇ Report download",
-            data=to_excel_bytes({"SKU Match": results_df}),
-            file_name="sku-match-report.xlsx",
-            mime=EXCEL_MIME,
+        st.info(
+            f"System catalog loaded: **{st.session_state.get('system_file_name','')}** "
+            f"({len(df_internal)} rows). Columns badalne ho to 'System SKU Catalog' tab me jaayein."
         )
+
+        if not internal_key_cols:
+            st.warning("'System SKU Catalog' tab me pehle Group ya Class column select karein.")
+        else:
+            client_file = st.file_uploader("Client ki SKU file (jaise aapka screenshot wali sheet)", type=["xlsx", "xls", "csv"], key="client_file2")
+
+            if client_file:
+                df_client = read_uploaded_file(client_file)
+                client_cols = list(df_client.columns)
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    group_default = [c for c in client_cols if GROUP_PATTERN.search(c)][:1]
+                    client_group_cols = st.multiselect(
+                        "Client Group / SKU Name column(s)", client_cols, default=group_default, key="client_group_cols"
+                    )
+                with c2:
+                    pack_default = [c for c in client_cols if IMG_PATTERN.search(c)]
+                    client_pack_cols = st.multiselect(
+                        "Client Packshot column(s) (Front/Back — jitne bhi hon, sab select karein)",
+                        client_cols, default=pack_default, key="client_pack_cols",
+                    )
+
+                threshold = st.slider("Fuzzy match sensitivity (naam thoda alag ho tab bhi match kare)", 50, 95, 75, step=5, format="%d%%") / 100.0
+
+                if st.button("🔎 Match karein", type="primary", disabled=not client_group_cols):
+                    internal_records = []
+                    for _, irow in df_internal.iterrows():
+                        combined = combine_cols(irow, internal_key_cols)
+                        pack_val = first_nonempty(irow, internal_pack_cols)
+                        internal_records.append((combined, pack_val))
+
+                    exact_map = {}
+                    for combined, pack_val in internal_records:
+                        norm = normalize(combined)
+                        if norm not in exact_map:
+                            exact_map[norm] = (combined, pack_val)
+
+                    results = []
+                    for _, crow in df_client.iterrows():
+                        client_combined = combine_cols(crow, client_group_cols)
+                        norm = normalize(client_combined)
+                        match_type, matched_val, confidence, matched_pack = "Unmatched", "", 0.0, ""
+
+                        if norm in exact_map:
+                            matched_val, matched_pack = exact_map[norm]
+                            match_type, confidence = "Exact", 1.0
+                        else:
+                            best_score, best_combined, best_pack = 0.0, None, ""
+                            for combined, pack_val in internal_records:
+                                sc = similarity(client_combined, combined)
+                                if sc > best_score:
+                                    best_score, best_combined, best_pack = sc, combined, pack_val
+                            if best_combined is not None and best_score >= threshold:
+                                matched_val, match_type, confidence, matched_pack = best_combined, "Fuzzy", best_score, best_pack
+
+                        client_pack_val = first_nonempty(crow, client_pack_cols)
+
+                        results.append({
+                            "Client SKU/Group": client_combined,
+                            "Client Packshot": client_pack_val,
+                            "Matched SKU (System)": matched_val,
+                            "Matched Packshot": matched_pack,
+                            "Match Type": match_type,
+                            "Confidence %": round(confidence * 100),
+                        })
+
+                    st.session_state.match_results = pd.DataFrame(results)
+
+                if "match_results" in st.session_state:
+                    results_df = st.session_state.match_results
+                    counts = results_df["Match Type"].value_counts().to_dict()
+                    m1, m2, m3 = st.columns(3)
+                    m1.metric("✔ Exact", counts.get("Exact", 0))
+                    m2.metric("⚠ Fuzzy", counts.get("Fuzzy", 0))
+                    m3.metric("✕ Unmatched", counts.get("Unmatched", 0))
+
+                    view = st.radio("View", ["Sabhi", "Fuzzy", "Unmatched"], horizontal=True)
+                    if view == "Fuzzy":
+                        show_df = results_df[results_df["Match Type"] == "Fuzzy"]
+                    elif view == "Unmatched":
+                        show_df = results_df[results_df["Match Type"] == "Unmatched"]
+                    else:
+                        show_df = results_df
+
+                    st.dataframe(
+                        show_df,
+                        use_container_width=True,
+                        hide_index=True,
+                        column_config={
+                            "Client Packshot": st.column_config.ImageColumn("Client Packshot", width="small"),
+                            "Matched Packshot": st.column_config.ImageColumn("Matched Packshot", width="small"),
+                        },
+                    )
+
+                    st.download_button(
+                        "⬇ Report download",
+                        data=to_excel_bytes({"SKU Match": results_df}),
+                        file_name="sku-match-report.xlsx",
+                        mime=EXCEL_MIME,
+                    )
