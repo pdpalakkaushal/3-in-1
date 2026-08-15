@@ -4,6 +4,8 @@ import difflib
 import re
 import io
 import os
+import base64
+import openpyxl
 
 st.set_page_config(page_title="GridSync", page_icon="📊", layout="wide")
 
@@ -60,6 +62,68 @@ def first_nonempty(row, cols):
         if c in row and pd.notna(row[c]) and str(row[c]).strip():
             return row[c]
     return ""
+
+
+def extract_embedded_images(file_bytes, filename):
+    """
+    Excel file ke andar seedhe chipki hui (embedded/pasted) images dhoondh kar
+    {(row_index, column_name): data_uri} ke roop me laata hai.
+    Ye SIRF System SKU Catalog aur SKU Match tabs me use hota hai — Merge/Compare
+    is function ko chhoote tak nahi (unpar koi asar nahi).
+    Sirf .xlsx files ke liye kaam karta hai — csv me embedded image possible nahi hoti.
+    Assume karta hai header row 1 (excel) me hai — agar aisa nahi hai to skip ho jaata hai, error nahi aata.
+    """
+    if not file_bytes or not filename or not filename.lower().endswith(".xlsx"):
+        return {}
+    try:
+        wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+        ws = wb.active
+        headers = {}
+        for cell in ws[1]:
+            if cell.value:
+                headers[cell.column] = str(cell.value).strip()
+
+        images_map = {}
+        for img in getattr(ws, "_images", []):
+            try:
+                anchor = img.anchor
+                col_idx = anchor._from.col + 1
+                row_idx = anchor._from.row + 1
+                df_row = row_idx - 2  # excel row 1 = header -> df row 0 = excel row 2
+                col_name = headers.get(col_idx)
+                if col_name is None or df_row < 0:
+                    continue
+                img_bytes = img._data()
+                b64 = base64.b64encode(img_bytes).decode("utf-8")
+                images_map[(df_row, col_name)] = f"data:image/png;base64,{b64}"
+            except Exception:
+                continue
+        return images_map
+    except Exception:
+        return {}
+
+
+def enrich_with_embedded_images(df, file_bytes, filename, pack_cols):
+    """
+    Packshot column khali ho (link na ho) lekin usi cell me image seedhi paste/insert
+    ki hui ho, to use dhoondh kar dataframe me bhar deta hai — taaki wo bhi match/preview ho sake.
+    """
+    if not pack_cols or not file_bytes:
+        return df
+    images_map = extract_embedded_images(file_bytes, filename)
+    if not images_map:
+        return df
+    df = df.copy().reset_index(drop=True)
+    for col in pack_cols:
+        if col not in df.columns:
+            continue
+        for i in df.index:
+            current_val = df.at[i, col]
+            if not str(current_val).strip():
+                data_uri = images_map.get((i, col))
+                if data_uri:
+                    df.at[i, col] = data_uri
+    return df
 
 
 EXCEL_MIME = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
@@ -253,13 +317,14 @@ elif tool == "System SKU Catalog":
     if catalog_file is not None:
         st.session_state.system_df = read_uploaded_file(catalog_file)
         st.session_state.system_file_name = catalog_file.name
+        st.session_state.system_file_bytes = catalog_file.getvalue()
 
     if "system_df" in st.session_state:
         df_catalog = st.session_state.system_df
         cols = list(df_catalog.columns)
 
         st.subheader("Columns select karein")
-        st.caption("Zaroorat ho to ek se zyada column bhi select kar sakte hain — dropdown me sirf click karke aur options jod dein.")
+        st.caption("Koi bhi column, kitne bhi select kar sakte hain — koi restriction nahi. Dropdown me click karke jitne chahiye utne jod dein.")
         c1, c2, c3 = st.columns(3)
         with c1:
             group_default = [c for c in cols if GROUP_PATTERN.search(c)][:1]
@@ -270,6 +335,15 @@ elif tool == "System SKU Catalog":
         with c3:
             pack_default = [c for c in cols if IMG_PATTERN.search(c)]
             system_pack_cols = st.multiselect("Packshot column(s)", cols, default=pack_default, key="sys_pack_cols")
+
+        # Packshot column me link na ho to, usi cell me paste ki hui image bhi dhoondh lein
+        if system_pack_cols:
+            df_catalog = enrich_with_embedded_images(
+                df_catalog,
+                st.session_state.get("system_file_bytes"),
+                st.session_state.get("system_file_name", ""),
+                system_pack_cols,
+            )
 
         search = st.text_input("🔍 Search (naam se dhoondhein)")
         view_df = df_catalog.copy()
@@ -286,9 +360,8 @@ elif tool == "System SKU Catalog":
         st.dataframe(display_df, use_container_width=True, hide_index=True, column_config=column_config)
         st.caption(f"Total {len(df_catalog)} entries system me hain — {len(view_df)} dikh rahi hain.")
         st.info(
-            "Note: Image sirf tab dikhegi jab packshot column me ek link (http se shuru hone wala URL) ho. "
-            "Agar file me image seedhi cell ke andar chipki hui hai (embedded picture), wo text ke roop me nahi padhi ja sakti — "
-            "us case me packshot column me image ka link/URL rakhna behtar rahega."
+            "Packshot ke liye ye tool image ka **link (URL)** aur **.xlsx me seedhi paste/insert ki hui image** — dono support karta hai. "
+            "Link ho to seedha uska preview aa jaayega; agar link nahi hai to cell me chipki image khud detect karke dikha di jaayegi."
         )
     else:
         st.info("Upar se apni system sheet upload karke shuru karein.")
@@ -340,11 +413,24 @@ else:
                 threshold = st.slider("Fuzzy match sensitivity (naam thoda alag ho tab bhi match kare)", 50, 95, 75, step=5, format="%d%%") / 100.0
 
                 if st.button("🔎 Match karein", type="primary", disabled=not client_group_cols):
+                    # Packshot column me link na ho to, usi cell me paste ki hui image bhi dhoondh lein
+                    # (system sheet aur client sheet dono ke liye)
+                    df_internal_m = enrich_with_embedded_images(
+                        df_internal,
+                        st.session_state.get("system_file_bytes"),
+                        st.session_state.get("system_file_name", ""),
+                        internal_pack_cols,
+                    )
+                    df_client_m = enrich_with_embedded_images(
+                        df_client, client_file.getvalue(), client_file.name, client_pack_cols
+                    )
+
                     internal_records = []
-                    for _, irow in df_internal.iterrows():
+                    for _, irow in df_internal_m.iterrows():
                         combined = combine_cols(irow, internal_key_cols)
                         pack_val = first_nonempty(irow, internal_pack_cols)
                         internal_records.append((combined, pack_val))
+                    st.session_state.internal_records = internal_records
 
                     exact_map = {}
                     for combined, pack_val in internal_records:
@@ -353,7 +439,7 @@ else:
                             exact_map[norm] = (combined, pack_val)
 
                     results = []
-                    for _, crow in df_client.iterrows():
+                    for _, crow in df_client_m.iterrows():
                         client_combined = combine_cols(crow, client_group_cols)
                         norm = normalize(client_combined)
                         match_type, matched_val, confidence, matched_pack = "Unmatched", "", 0.0, ""
@@ -386,10 +472,18 @@ else:
                 if "match_results" in st.session_state:
                     results_df = st.session_state.match_results
                     counts = results_df["Match Type"].value_counts().to_dict()
-                    m1, m2, m3 = st.columns(3)
+                    total = len(results_df)
+                    auto_matched = total - counts.get("Unmatched", 0)
+
+                    m1, m2, m3, m4 = st.columns(4)
                     m1.metric("✔ Exact", counts.get("Exact", 0))
                     m2.metric("⚠ Fuzzy", counts.get("Fuzzy", 0))
-                    m3.metric("✕ Unmatched", counts.get("Unmatched", 0))
+                    m3.metric("✏️ Manual", counts.get("Manual", 0))
+                    m4.metric("✕ Unmatched", counts.get("Unmatched", 0))
+                    st.progress(
+                        auto_matched / total if total else 0,
+                        text=f"{auto_matched}/{total} SKU automatically match ho gaye ({round(100 * auto_matched / total) if total else 0}%)",
+                    )
 
                     view = st.radio("View", ["Sabhi", "Fuzzy", "Unmatched"], horizontal=True)
                     if view == "Fuzzy":
@@ -408,6 +502,37 @@ else:
                             "Matched Packshot": st.column_config.ImageColumn("Matched Packshot", width="small"),
                         },
                     )
+
+                    # Baaki bache unmatched items ko haath se (manually) theek karne ka option
+                    unmatched_mask = results_df["Match Type"] == "Unmatched"
+                    if unmatched_mask.any():
+                        internal_records = st.session_state.get("internal_records", [])
+                        options_list = ["— select —"] + [c for c, _ in internal_records if c]
+                        with st.expander(f"✏️ {int(unmatched_mask.sum())} unmatched items ko manually fix karein"):
+                            edit_df = results_df.loc[unmatched_mask, ["Client SKU/Group"]].copy()
+                            edit_df["System me sahi match"] = "— select —"
+                            edited = st.data_editor(
+                                edit_df,
+                                column_config={
+                                    "System me sahi match": st.column_config.SelectboxColumn(
+                                        "System me sahi match", options=options_list
+                                    )
+                                },
+                                hide_index=True,
+                                use_container_width=True,
+                                key="manual_fix_editor",
+                            )
+                            if st.button("✅ Manual matches apply karein"):
+                                pack_lookup = dict(internal_records)
+                                for idx, row in edited.iterrows():
+                                    chosen = row["System me sahi match"]
+                                    if chosen and chosen != "— select —":
+                                        results_df.loc[idx, "Matched SKU (System)"] = chosen
+                                        results_df.loc[idx, "Matched Packshot"] = pack_lookup.get(chosen, "")
+                                        results_df.loc[idx, "Match Type"] = "Manual"
+                                        results_df.loc[idx, "Confidence %"] = 100
+                                st.session_state.match_results = results_df
+                                st.rerun()
 
                     st.download_button(
                         "⬇ Report download",
