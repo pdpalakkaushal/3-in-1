@@ -325,30 +325,52 @@ def save_attribute_options(options):
         pass
 
 
-def find_column_for_attribute(df_columns, attribute_name):
-    best_col, best_score = None, 0.0
-    for c in df_columns:
-        sc = similarity(attribute_name, c)
-        if sc > best_score:
-            best_score, best_col = sc, c
-    return best_col if best_score >= 0.5 else None
+ATTRIBUTE_NAME_PATTERN = re.compile(r"attribute.?name", re.I)
+ATTRIBUTE_VALUE_PATTERN = re.compile(r"attribute.?value", re.I)
 
 
-def check_attribute_completeness(df, identifier_cols, attributes):
+def guess_attribute_columns(df):
+    """Detects the 'attribute_name' and 'attribute_value' columns in a long-format
+    CGC attribute file (one row per attribute, per Category/Group/Class)."""
+    name_col = next((c for c in df.columns if ATTRIBUTE_NAME_PATTERN.search(c)), None)
+    value_col = next((c for c in df.columns if ATTRIBUTE_VALUE_PATTERN.search(c)), None)
+    return name_col, value_col
+
+
+def check_attribute_completeness_long(df, id_cols, attr_name_col, attr_value_col, attributes):
+    """
+    Works with long-format attribute files:
+    category_name, group_name, class_name, attribute_name, attribute_value, ...
+    Each Category/Group/Class combination spans multiple rows (one per attribute).
+    For each selected attribute, finds every CGC combination where that attribute
+    is either never tagged, or tagged with an empty value.
+    """
+    work = df.copy()
+    work["_cgc_key"] = work[id_cols].astype(str).agg(" | ".join, axis=1)
+    all_keys_df = work[["_cgc_key"] + id_cols].drop_duplicates(subset="_cgc_key")
+    total_cgc = len(all_keys_df)
+
     summary_rows, missing_records = [], []
     for attr in attributes:
-        col = find_column_for_attribute(list(df.columns), attr)
-        if col is None:
-            summary_rows.append({"Attribute": attr, "Matched Column": "Not found in file", "Missing Count": "-", "Total Rows": len(df)})
-            continue
-        missing_mask = df[col].astype(str).str.strip() == ""
-        missing_df = df[missing_mask]
-        summary_rows.append({"Attribute": attr, "Matched Column": col, "Missing Count": len(missing_df), "Total Rows": len(df)})
-        for _, row in missing_df.iterrows():
-            rec = {ic: row[ic] for ic in identifier_cols if ic in row}
+        attr_norm = normalize(attr)
+        attr_rows = work[work[attr_name_col].astype(str).apply(normalize) == attr_norm]
+        present_keys = set(attr_rows[attr_rows[attr_value_col].astype(str).str.strip() != ""]["_cgc_key"])
+        missing_keys_df = all_keys_df[~all_keys_df["_cgc_key"].isin(present_keys)]
+        missing_count = len(missing_keys_df)
+
+        summary_rows.append({
+            "Attribute": attr,
+            "Found in File": "Yes" if not attr_rows.empty else "No",
+            "Total CGC": total_cgc,
+            "Filled": total_cgc - missing_count,
+            "Missing": missing_count,
+        })
+        for _, r in missing_keys_df.iterrows():
+            rec = {"CGC": " > ".join(str(r[c]) for c in id_cols)}
+            rec.update({c: r[c] for c in id_cols})
             rec["Missing Attribute"] = attr
-            rec["Matched Column"] = col
             missing_records.append(rec)
+
     return pd.DataFrame(summary_rows), pd.DataFrame(missing_records)
 
 
@@ -433,10 +455,6 @@ if tool == "Merge & Format":
                     all_rows.append(out)
             merged_df = pd.DataFrame(all_rows, columns=std_fields + ["Source File"])
             st.session_state.merged_df = merged_df
-            summary_df, duplicates_df, issues_df = analyze_data_quality(merged_df, std_fields)
-            st.session_state.quality_summary = summary_df
-            st.session_state.quality_duplicates = duplicates_df
-            st.session_state.quality_issues = issues_df
 
     if "merged_df" in st.session_state:
         merged_df = st.session_state.merged_df
@@ -447,11 +465,12 @@ if tool == "Merge & Format":
         st.subheader("Rows per source file")
         st.bar_chart(merged_df["Source File"].value_counts())
 
-        st.subheader("Data Quality Summary")
-        st.dataframe(st.session_state.quality_summary, use_container_width=True, hide_index=True)
-
-        st.subheader("Filter merged data")
-        filter_cols = st.multiselect("Choose up to 7 columns to filter by", options=std_fields, key="merge_filter_cols")
+        st.subheader("Filter data")
+        st.caption(
+            "Choose up to 5 columns and specific values — this filter applies to the data preview, "
+            "the Data Quality Report, and the downloadable files below."
+        )
+        filter_cols = st.multiselect("Choose up to 5 columns to filter by", options=std_fields, key="merge_filter_cols")
         if len(filter_cols) > 5:
             st.warning("Only the first 5 selected columns will be used.")
             filter_cols = filter_cols[:5]
@@ -463,9 +482,18 @@ if tool == "Merge & Format":
             if chosen:
                 filtered_df = filtered_df[filtered_df[fc].isin(chosen)]
 
+        is_filtered = bool(filter_cols) and any(
+            st.session_state.get(f"filter_val_{fc}") for fc in filter_cols
+        )
+
         st.dataframe(filtered_df.head(100), use_container_width=True)
         if len(filtered_df) > 100:
             st.caption(f"Showing first 100 of {len(filtered_df)} filtered rows.")
+
+        summary_df, duplicates_df, issues_df = analyze_data_quality(filtered_df, std_fields)
+
+        st.subheader("Data Quality Summary" + (" (filtered)" if is_filtered else ""))
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
         d1, d2, d3 = st.columns(3)
         with d1:
@@ -477,11 +505,11 @@ if tool == "Merge & Format":
             )
         with d2:
             st.download_button(
-                "⬇ Download Data Quality Report",
+                "⬇ Download Data Quality Report" + (" (filtered)" if is_filtered else ""),
                 data=to_excel_bytes({
-                    "Summary": st.session_state.quality_summary,
-                    "Duplicate Rows": st.session_state.quality_duplicates,
-                    "Issues (Spaces & Special Characters)": st.session_state.quality_issues,
+                    "Summary": summary_df,
+                    "Duplicate Rows": duplicates_df,
+                    "Issues (Spaces & Special Characters)": issues_df,
                 }),
                 file_name="data-quality-report.xlsx",
                 mime=EXCEL_MIME,
@@ -508,7 +536,7 @@ elif tool == "Compare Files":
     key_a = key_b = None
 
     with c1:
-        file_a = st.file_uploader("POC Project File", type=["xlsx", "xls", "csv"], key="file_a")
+        file_a = st.file_uploader("POS Project File", type=["xlsx", "xls", "csv"], key="file_a")
         if file_a:
             df_a = read_uploaded_file(file_a)
             auto_key_a = guess_name_columns(df_a)
@@ -545,7 +573,7 @@ elif tool == "Compare Files":
                     changed_rows.append({
                         "Key": row_a[key_a],
                         "Column": col,
-                        "Value in POC Project File": va,
+                        "Value in POS Project File": va,
                         "Value in Pilot Project File": vb,
                     })
         for norm_key, idx_b in map_b.items():
@@ -587,7 +615,7 @@ elif tool == "Compare Files":
             "⬇ Download Comparison Report",
             data=to_excel_bytes({
                 "Changed": res["changed"],
-                "Only in POC Project File": res["only_a"],
+                "Only in POS Project File": res["only_a"],
                 "Only in Pilot Project File": res["only_b"],
                 "Column-wise Summary": res["column_summary"],
             }),
@@ -598,47 +626,76 @@ elif tool == "Compare Files":
     st.divider()
     st.header("Attribute Completeness Check")
     st.caption(
-        "Check whether specific attributes (e.g. Brand) are filled in for every "
-        "Category / Group / Class entry in your main project file."
+        "Upload your main project's CGC attribute file — a long-format file with one row per "
+        "attribute (e.g. category_name, group_name, class_name, attribute_name, attribute_value). "
+        "The tool reads every attribute name found in the file, and for any attribute you select "
+        "(e.g. Brand), reports every Category / Group / Class where that attribute is missing or empty."
     )
 
     if "attribute_options" not in st.session_state:
         st.session_state.attribute_options = load_attribute_options()
 
+    cgc_file = st.file_uploader(
+        "Upload the main project's CGC attribute file",
+        type=["xlsx", "xls", "csv"], key="cgc_file",
+    )
+
+    id_cols, attr_name_col, attr_value_col, df_cgc = [], None, None, None
+
+    if cgc_file:
+        df_cgc = read_uploaded_file(cgc_file)
+        auto_id_cols = [c for c in df_cgc.columns if CGC_PATTERN.search(c)]
+        auto_name_col, auto_value_col = guess_attribute_columns(df_cgc)
+
+        st.success(
+            f"🤖 Auto-detected — Identifiers: **{', '.join(auto_id_cols) or 'not found'}** · "
+            f"Attribute Name column: **{auto_name_col or 'not found'}** · "
+            f"Attribute Value column: **{auto_value_col or 'not found'}**"
+        )
+
+        with st.expander("⚙️ Change identifier / attribute columns"):
+            id_cols = st.multiselect(
+                "Identifier column(s) (Category / Group / Class)",
+                list(df_cgc.columns), default=auto_id_cols, key="cgc_id_cols"
+            )
+            col_options = list(df_cgc.columns)
+            name_idx = col_options.index(auto_name_col) if auto_name_col in col_options else 0
+            value_idx = col_options.index(auto_value_col) if auto_value_col in col_options else 0
+            attr_name_col = st.selectbox("Attribute Name column", col_options, index=name_idx, key="cgc_attr_name_col")
+            attr_value_col = st.selectbox("Attribute Value column", col_options, index=value_idx, key="cgc_attr_value_col")
+
+        id_cols = st.session_state.get("cgc_id_cols", auto_id_cols)
+        attr_name_col = st.session_state.get("cgc_attr_name_col", auto_name_col)
+        attr_value_col = st.session_state.get("cgc_attr_value_col", auto_value_col)
+
+        if attr_name_col:
+            discovered = sorted(set(df_cgc[attr_name_col].astype(str).str.strip()) - {""})
+            newly_found = [a for a in discovered if a not in st.session_state.attribute_options]
+            if newly_found:
+                st.session_state.attribute_options.extend(newly_found)
+                save_attribute_options(st.session_state.attribute_options)
+                st.caption(f"📎 {len(newly_found)} new attribute name(s) discovered in this file and added to the list below.")
+
     ac1, ac2 = st.columns([4, 1])
-    new_attr = ac1.text_input("Add a new attribute", key="new_attr_input", placeholder="e.g. Brand", label_visibility="collapsed")
+    new_attr = ac1.text_input("Add a custom attribute", key="new_attr_input", placeholder="e.g. Brand", label_visibility="collapsed")
     if ac2.button("+ Add Attribute") and new_attr.strip():
         if new_attr.strip() not in st.session_state.attribute_options:
             st.session_state.attribute_options.append(new_attr.strip())
             save_attribute_options(st.session_state.attribute_options)
         st.rerun()
-    st.caption("Attributes added here are saved and become available to everyone using this tool.")
+    st.caption("Attribute names discovered in uploaded files, and any added manually, are saved and reused by everyone on this tool.")
 
     selected_attrs = st.multiselect(
         "Select attributes to check", options=sorted(st.session_state.attribute_options), key="selected_attrs"
     )
 
-    cgc_file = st.file_uploader(
-        "Upload the main project's CGC attribute file (Category / Group / Class + attribute columns)",
-        type=["xlsx", "xls", "csv"], key="cgc_file",
-    )
-
-    if cgc_file and selected_attrs:
-        df_cgc = read_uploaded_file(cgc_file)
-        auto_id_cols = [c for c in df_cgc.columns if CGC_PATTERN.search(c)]
-        if not auto_id_cols:
-            auto_id_cols = guess_name_columns(df_cgc)
-
-        with st.expander("⚙️ Change identifier columns (Category / Group / Class)"):
-            id_cols = st.multiselect("Identifier column(s)", list(df_cgc.columns), default=auto_id_cols, key="cgc_id_cols")
-
-        if st.button("Check Completeness", type="primary"):
-            if not id_cols:
-                st.warning("Please select at least one identifier column.")
-            else:
-                summary_df, missing_df = check_attribute_completeness(df_cgc, id_cols, selected_attrs)
-                st.session_state.attr_summary = summary_df
-                st.session_state.attr_missing = missing_df
+    can_check = bool(cgc_file and selected_attrs and id_cols and attr_name_col and attr_value_col)
+    if st.button("Check Completeness", type="primary", disabled=not can_check):
+        summary_df, missing_df = check_attribute_completeness_long(
+            df_cgc, id_cols, attr_name_col, attr_value_col, selected_attrs
+        )
+        st.session_state.attr_summary = summary_df
+        st.session_state.attr_missing = missing_df
 
     if "attr_summary" in st.session_state:
         st.subheader("Completeness Summary")
