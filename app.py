@@ -536,7 +536,7 @@ elif tool == "Compare Files":
     key_a = key_b = None
 
     with c1:
-        file_a = st.file_uploader("POS Project File", type=["xlsx", "xls", "csv"], key="file_a")
+        file_a = st.file_uploader("POC Project File", type=["xlsx", "xls", "csv"], key="file_a")
         if file_a:
             df_a = read_uploaded_file(file_a)
             auto_key_a = guess_name_columns(df_a)
@@ -573,7 +573,7 @@ elif tool == "Compare Files":
                     changed_rows.append({
                         "Key": row_a[key_a],
                         "Column": col,
-                        "Value in POS Project File": va,
+                        "Value in POC Project File": va,
                         "Value in Pilot Project File": vb,
                     })
         for norm_key, idx_b in map_b.items():
@@ -598,7 +598,7 @@ elif tool == "Compare Files":
         res = st.session_state.compare_result
         t1, t2, t3, t4 = st.tabs([
             f"Changed ({len(res['changed'])})",
-            f"Only in POS File ({len(res['only_a'])})",
+            f"Only in POC File ({len(res['only_a'])})",
             f"Only in Pilot File ({len(res['only_b'])})",
             f"Column Summary ({len(res['column_summary'])})",
         ])
@@ -615,7 +615,7 @@ elif tool == "Compare Files":
             "⬇ Download Comparison Report",
             data=to_excel_bytes({
                 "Changed": res["changed"],
-                "Only in POS Project File": res["only_a"],
+                "Only in POC Project File": res["only_a"],
                 "Only in Pilot Project File": res["only_b"],
                 "Column-wise Summary": res["column_summary"],
             }),
